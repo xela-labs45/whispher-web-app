@@ -258,25 +258,15 @@
     </div>
 
     <div class="sidebar-section" style="margin-top: 20px;">
-      <div class="section-label">Model settings</div>
+      <div class="section-label">Transcription</div>
       <div class="settings-grid">
 
         <div class="setting">
-          <label>Model size</label>
-          <select id="modelSize">
-            <option value="tiny">tiny — fastest, lower accuracy</option>
-            <option value="base">base — fast, decent accuracy</option>
-            <option value="small">small — good balance</option>
-            <option value="medium" selected>medium — recommended</option>
-            <option value="large-v3">large-v3 — best accuracy</option>
-          </select>
-        </div>
-
-        <div class="setting">
-          <label>Compute type</label>
-          <select id="computeType">
-            <option value="int8" selected>int8 — CPU optimised (recommended)</option>
-            <option value="float32">float32 — full precision</option>
+          <label>Speed / accuracy</label>
+          <select id="speedPreset">
+            <option value="fast_draft" selected>Fast draft — base, beam 1</option>
+            <option value="balanced">Balanced — small, beam 3</option>
+            <option value="accurate">Accurate — medium, beam 5</option>
           </select>
         </div>
 
@@ -292,11 +282,6 @@
             <option value="zh">Chinese</option>
             <option value="ar">Arabic</option>
           </select>
-        </div>
-
-        <div class="setting">
-          <label>Beam size <span style="color:var(--text3)">(accuracy vs speed)</span></label>
-          <input type="number" id="beamSize" value="5" min="1" max="10" />
         </div>
 
         <label class="checkbox-row">
@@ -375,6 +360,7 @@
   let audioDuration = 0;
   let currentSegmentEl = null;
   let startTime = null;
+  let isRunning = false;
 
   // ─── Elements ────────────────────────────────────────────────────────────
   const dropZone      = document.getElementById('dropZone');
@@ -397,10 +383,8 @@
   const copyBtn       = document.getElementById('copyBtn');
   const exportBtn     = document.getElementById('exportBtn');
 
-  const modelSize     = document.getElementById('modelSize');
-  const computeType   = document.getElementById('computeType');
+  const speedPreset   = document.getElementById('speedPreset');
   const language      = document.getElementById('language');
-  const beamSize      = document.getElementById('beamSize');
   const wordTsCheck   = document.getElementById('wordTimestamps');
   const exportFormat  = document.getElementById('exportFormat');
 
@@ -412,6 +396,7 @@
   }
 
   function setFile(file) {
+    if (isRunning) return;
     selectedFile = file;
     fileName.textContent = file.name;
     fileMeta.textContent = formatBytes(file.size);
@@ -422,6 +407,7 @@
   }
 
   function clearFile() {
+    if (isRunning) return;
     selectedFile = null;
     fileInput.value = '';
     fileCard.style.display = 'none';
@@ -447,6 +433,26 @@
   function setStatus(text, cls) {
     statusBadge.textContent = text;
     statusBadge.className = 'badge badge-status ' + (cls || '');
+  }
+
+  function setRunning(running) {
+    isRunning = running;
+    runBtn.disabled = running || !selectedFile;
+    fileRemove.disabled = running;
+    fileInput.disabled = running;
+    dropZone.style.pointerEvents = running ? 'none' : '';
+  }
+
+  function showError(message) {
+    setStatus('Error', 'error');
+    progressRow.style.display = 'none';
+    emptyState.style.display = 'none';
+
+    const errRow = document.createElement('div');
+    errRow.style.cssText = 'color: var(--red); font-size: 13px; padding: 8px 0;';
+    errRow.textContent = 'Error: ' + message;
+    transcriptWrap.appendChild(errRow);
+    transcriptWrap.scrollTop = transcriptWrap.scrollHeight;
   }
 
   function fmtTime(s) {
@@ -510,100 +516,156 @@
   }
 
   // ─── Transcription ───────────────────────────────────────────────────────
+  async function responseErrorMessage(response) {
+    try {
+      const contentType = response.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const body = await response.json();
+        return body.detail || JSON.stringify(body);
+      }
+      const text = await response.text();
+      return text || response.statusText;
+    } catch(e) {
+      return response.statusText || 'Request failed';
+    }
+  }
+
+  function parseSsePart(part) {
+    const lines = part.split('\n');
+    const eventLine = lines.find(l => l.startsWith('event:'));
+    const dataLines = lines.filter(l => l.startsWith('data:'));
+    if (!eventLine || dataLines.length === 0) return null;
+
+    return {
+      event: eventLine.slice(6).trim(),
+      data: JSON.parse(dataLines.map(l => l.slice(5).trimStart()).join('\n')),
+    };
+  }
+
   runBtn.addEventListener('click', async () => {
-    if (!selectedFile) return;
+    if (!selectedFile || isRunning) return;
 
     reset();
-    runBtn.disabled = true;
-    setStatus('Running…', 'running');
+    setRunning(true);
+    setStatus('Running...', 'running');
     progressRow.style.display = 'block';
     startTime = Date.now();
 
     const formData = new FormData();
     formData.append('file', selectedFile);
-    formData.append('model_size', modelSize.value);
-    formData.append('compute_type', computeType.value);
+    formData.append('speed_preset', speedPreset.value);
     formData.append('language', language.value);
-    formData.append('beam_size', beamSize.value);
     formData.append('word_timestamps', wordTsCheck.checked ? 'true' : 'false');
 
     let response;
     try {
       response = await fetch('/transcribe', { method: 'POST', body: formData });
     } catch(e) {
-      setStatus('Connection error', 'error');
-      progressRow.style.display = 'none';
-      runBtn.disabled = false;
+      showError('Could not connect to the transcription server.');
+      setRunning(false);
+      return;
+    }
+
+    if (!response.ok) {
+      showError(await responseErrorMessage(response));
+      setRunning(false);
+      return;
+    }
+
+    if (!response.body) {
+      showError('The browser did not expose a streaming response body.');
+      setRunning(false);
       return;
     }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    let terminalReceived = false;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      buf += decoder.decode(value, { stream: true });
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split('\n\n');
+        buf = parts.pop();
 
-      const parts = buf.split('\n\n');
-      buf = parts.pop();   // keep incomplete chunk
+        for (const part of parts) {
+          const parsed = parseSsePart(part);
+          if (!parsed) continue;
 
-      for (const part of parts) {
-        const lines = part.split('\n');
-        const eventLine = lines.find(l => l.startsWith('event:'));
-        const dataLine  = lines.find(l => l.startsWith('data:'));
-        if (!eventLine || !dataLine) continue;
+          const { event, data } = parsed;
 
-        const event = eventLine.slice(7).trim();
-        const data  = JSON.parse(dataLine.slice(5).trim());
+          if (event === 'status') {
+            progressLabel.textContent = data.message;
+          }
 
-        if (event === 'status') {
-          progressLabel.textContent = data.message;
-        }
+          if (event === 'info') {
+            detectedLanguage = data.language || 'unknown';
+            audioDuration = data.duration || 0;
+            const probability = data.language_probability == null ? '' : ' · ' + data.language_probability + '%';
+            langBadge.textContent = detectedLanguage.toUpperCase() + probability;
+            langBadge.style.display = '';
+            const chunkText = data.chunk_count ? ` · ${data.chunk_count} chunks` : '';
+            progressLabel.textContent = `Transcribing ${fmtTime(audioDuration)} of audio${chunkText}...`;
+          }
 
-        if (event === 'info') {
-          detectedLanguage = data.language;
-          audioDuration = data.duration;
-          langBadge.textContent = data.language.toUpperCase() + ' · ' + data.language_probability + '%';
-          langBadge.style.display = '';
-          progressLabel.textContent = `Transcribing ${fmtTime(audioDuration)} of audio…`;
-        }
+          if (event === 'chunk_start') {
+            const pct = Math.max(0, Math.min(100, Math.round(data.progress || 0)));
+            progressFill.style.width = pct + '%';
+            progressPct.textContent = pct + '%';
+            progressLabel.textContent = `Chunk ${data.index} of ${data.total} · ${fmtTime(data.start)}-${fmtTime(data.end)}`;
+          }
 
-        if (event === 'segment') {
-          addSegment(data);
-          const pct = Math.round(data.progress);
-          progressFill.style.width = pct + '%';
-          progressPct.textContent = pct + '%';
-          const elapsed = (Date.now() - startTime) / 1000;
-          const remaining = data.progress > 0 ? (elapsed / data.progress * (100 - data.progress)) : null;
-          progressLabel.textContent = `Segment ${data.index} of ${data.total}` +
-            (remaining ? ` · ~${Math.round(remaining)}s remaining` : '');
-        }
+          if (event === 'segment') {
+            addSegment(data);
+            const pct = Math.max(0, Math.min(100, Math.round(data.progress || 0)));
+            progressFill.style.width = pct + '%';
+            progressPct.textContent = pct + '%';
+            const elapsed = (Date.now() - startTime) / 1000;
+            const remaining = pct > 0 && pct < 100 ? (elapsed / pct * (100 - pct)) : null;
+            const chunkText = data.chunk_total ? ` · chunk ${data.chunk_index}/${data.chunk_total}` : '';
+            progressLabel.textContent = `Segment ${data.index}${chunkText}` +
+              (remaining ? ` · ~${Math.round(remaining)}s remaining` : '');
+          }
 
-        if (event === 'done') {
-          fullText = data.full_text;
-          if (currentSegmentEl) currentSegmentEl.classList.remove('current');
-          progressFill.style.width = '100%';
-          progressPct.textContent = '100%';
-          progressLabel.textContent = `Done — ${data.segment_count} segments, ${fmtTime(data.duration)}`;
-          setStatus('Done', 'done');
-          copyBtn.disabled = false;
-          exportBtn.disabled = false;
-          runBtn.disabled = false;
-        }
+          if (event === 'chunk_done') {
+            const pct = Math.max(0, Math.min(100, Math.round(data.progress || 0)));
+            progressFill.style.width = pct + '%';
+            progressPct.textContent = pct + '%';
+            progressLabel.textContent = `Finished chunk ${data.index} of ${data.total}`;
+          }
 
-        if (event === 'error') {
-          setStatus('Error', 'error');
-          const errRow = document.createElement('div');
-          errRow.style.cssText = 'color: var(--red); font-size: 13px; padding: 8px 0;';
-          errRow.textContent = '⚠ ' + data.message;
-          transcriptWrap.appendChild(errRow);
-          runBtn.disabled = false;
-          progressRow.style.display = 'none';
+          if (event === 'done') {
+            terminalReceived = true;
+            fullText = data.full_text || segments.map(s => s.text).join(' ');
+            if (currentSegmentEl) currentSegmentEl.classList.remove('current');
+            progressFill.style.width = '100%';
+            progressPct.textContent = '100%';
+            progressLabel.textContent = `Done - ${data.segment_count} segments, ${fmtTime(data.duration || 0)}`;
+            setStatus('Done', 'done');
+            copyBtn.disabled = false;
+            exportBtn.disabled = false;
+            setRunning(false);
+          }
+
+          if (event === 'error') {
+            terminalReceived = true;
+            showError(data.message || 'Transcription failed.');
+            setRunning(false);
+          }
         }
       }
+
+      if (!terminalReceived) {
+        showError('Connection closed before transcription completed.');
+      }
+    } catch(e) {
+      showError('The transcription stream was interrupted or malformed.');
+    } finally {
+      setRunning(false);
     }
   });
 
@@ -613,6 +675,8 @@
       const orig = copyBtn.innerHTML;
       copyBtn.innerHTML = '<i class="fa-solid fa-check"></i> Copied!';
       setTimeout(() => { copyBtn.innerHTML = orig; }, 1500);
+    }).catch(() => {
+      showError('Clipboard access was denied by the browser.');
     });
   });
 
@@ -632,8 +696,12 @@
     const blob = new Blob([content], { type: mime });
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement('a');
-    a.href = url; a.download = filename; a.click();
-    URL.revokeObjectURL(url);
+    a.href = url;
+    a.download = filename.replace(/[^a-z0-9._-]+/gi, '_');
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
   exportBtn.addEventListener('click', () => {

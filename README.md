@@ -13,7 +13,8 @@ Streamlit re-runs the entire script on every interaction, which makes long-runni
 
 ## Features
 
-- Real-time segment streaming via SSE — see the transcript build live
+- Chunked real-time streaming via SSE — long files show text as chunks complete
+- CPU speed presets — fast draft, balanced, and accurate modes
 - Model cache — model loads once, reused across requests (no 10-second reload penalty)
 - Silero VAD filter — silences automatically skipped
 - Language auto-detection with confidence score
@@ -48,12 +49,12 @@ Open `http://localhost:8000` in your browser.
 | Model | RAM | Speed (13 min audio) | Best for |
 |---|---|---|---|
 | tiny | ~500 MB | ~1 min | Quick drafts |
-| base | ~700 MB | ~1.5 min | Low-RAM machines |
+| **base** | **~700 MB** | **~1.5 min** | **Default fast draft** |
 | small | ~1.5 GB | ~2 min | Good daily balance |
-| **medium** | **~2.5 GB** | **~4 min** | **Recommended** |
+| medium | ~2.5 GB | ~4 min | Accurate preset |
 | large-v3 | ~4+ GB | ~6 min | Maximum accuracy |
 
-The medium model is the default. On first run it downloads from HuggingFace (~1.5 GB) and caches locally — subsequent runs are instant.
+The browser defaults to **Fast draft** mode for long CPU-only files. It uses the `base` model, INT8 quantization, beam size 1, batched inference, 8 CPU threads, and 5-minute chunks with 5-second overlap so text appears progressively. Choose **Balanced** for the `small` model or **Accurate** for `medium`.
 
 ---
 
@@ -74,4 +75,6 @@ transcriber/
 - No GPU required — runs on CPU with INT8 quantization
 - No FFmpeg install needed — faster-whisper bundles PyAV
 - Files are processed in a temporary directory and deleted immediately after transcription
-- The model is loaded once and kept in memory — restart the server to switch models via settings, or just select a different one in the UI (it will reload automatically)
+- Long files are decoded once, split into overlapping chunks, and streamed chunk-by-chunk
+- The app allows one transcription job at a time so CPU threads do not fight each other
+- The model is loaded once and kept in memory; changing speed presets reloads the matching model automatically

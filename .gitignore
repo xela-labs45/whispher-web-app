@@ -1,1 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local configuration
+.env
+.env.*
+
+# Runtime and generated outputs
+*.log
+uploads/
+transcripts/
+*.srt
+*.vtt
+
 AGENTS.md
