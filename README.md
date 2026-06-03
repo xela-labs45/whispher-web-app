@@ -1,80 +1,74 @@
-# 🎙️ Whisper Transcriber
+# Whisper Transcriber
 
-Local audio/video transcription powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and FastAPI.  
-Segments stream to the browser in real time as Whisper processes your file — no waiting for the whole job to finish.
-
----
-
-## Why FastAPI instead of Streamlit?
-
-Streamlit re-runs the entire script on every interaction, which makes long-running tasks (2–5 min transcription) awkward and blocks the UI. FastAPI with Server-Sent Events (SSE) lets Whisper segments stream to the browser token-by-token as they are produced, giving a much better experience.
-
----
+Local audio/video transcription powered by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and FastAPI. The app is optimized for CPU-only machines: long files are decoded once, split into overlapping chunks, transcribed with batched inference, and streamed to the browser as text becomes available.
 
 ## Features
 
-- Chunked real-time streaming via SSE — long files show text as chunks complete
-- CPU speed presets — fast draft, balanced, and accurate modes
-- Model cache — model loads once, reused across requests (no 10-second reload penalty)
-- Silero VAD filter — silences automatically skipped
-- Language auto-detection with confidence score
-- Word-level timestamps (optional)
-- Export to TXT, SRT, and/or JSON
-- Drag-and-drop file upload
-- Supports MP4, MKV, MOV, AVI, MP3, WAV, M4A, WEBM, FLAC, OGG
-
----
+- Chunked Server-Sent Events (SSE) streaming so long files show progress and text incrementally
+- CPU speed presets: Fast draft, Balanced, and Accurate
+- Batched faster-whisper inference with INT8 CPU quantization by default
+- Model and batched pipeline cache to avoid reloading the same model per request
+- One active transcription job at a time so CPU threads do not fight each other
+- Language auto-detection, optional word-level timestamps, and export to TXT, SRT, or JSON
+- Safe upload handling: extension validation, temp-file cleanup, empty-file rejection, and upload size cap
 
 ## Setup
 
 ```bash
-# 1. Clone / copy the project
-cd transcriber
+# 1. Create and activate a local virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
-# 2. Install Python dependencies
+# 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Run
+# 3. Run the server
 python main.py
 # or
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Open `http://localhost:8000` in your browser.
+Open `http://localhost:8000` in your browser. The first transcription with a new model downloads model files from Hugging Face and caches them locally.
 
----
+## CPU Presets
 
-## Model guide (CPU INT8)
+| Preset | Model | Beam | Batch | Chunking | Best for |
+|---|---|---:|---:|---|---|
+| Fast draft | `base` | 1 | 4 | 5 min + 5 sec overlap | Long CPU-only files and quick drafts |
+| Balanced | `small` | 3 | 4 | 5 min + 5 sec overlap | Better accuracy without jumping to medium |
+| Accurate | `medium` | 5 | 2 | 4 min + 5 sec overlap | Slower, higher-quality transcripts |
 
-| Model | RAM | Speed (13 min audio) | Best for |
-|---|---|---|---|
-| tiny | ~500 MB | ~1 min | Quick drafts |
-| **base** | **~700 MB** | **~1.5 min** | **Default fast draft** |
-| small | ~1.5 GB | ~2 min | Good daily balance |
-| medium | ~2.5 GB | ~4 min | Accurate preset |
-| large-v3 | ~4+ GB | ~6 min | Maximum accuracy |
+All presets use `int8`, up to 8 CPU threads, VAD silence filtering, and `faster_whisper.BatchedInferencePipeline`. The browser defaults to Fast draft.
 
-The browser defaults to **Fast draft** mode for long CPU-only files. It uses the `base` model, INT8 quantization, beam size 1, batched inference, 8 CPU threads, and 5-minute chunks with 5-second overlap so text appears progressively. Choose **Balanced** for the `small` model or **Accurate** for `medium`.
+## API
 
----
+`POST /transcribe` accepts multipart form data:
 
-## Project structure
+- `file`: audio/video upload. Supported extensions: MP4, MKV, MOV, AVI, MP3, WAV, M4A, WEBM, OGG, FLAC.
+- `speed_preset`: `fast_draft`, `balanced`, or `accurate`. Defaults to `fast_draft`.
+- `language`: `auto` or a language code such as `en`, `fr`, `de`, `es`, `pt`, `zh`, `ar`.
+- `word_timestamps`: `true` or `false`.
 
+For compatibility, the backend also accepts custom fields when `speed_preset` is omitted: `model_size`, `compute_type`, `beam_size`, `batch_size`, `cpu_threads`, `num_workers`, `chunk_seconds`, and `overlap_seconds`.
+
+The response is `text/event-stream` and may emit `status`, `info`, `chunk_start`, `segment`, `chunk_done`, `done`, or `error` events. Check service status with `GET /health`.
+
+## Project Structure
+
+```text
+whispher-web-app/
+├── main.py            # FastAPI backend, upload validation, chunking, SSE stream
+├── index.html         # Browser UI served at /
+├── requirements.txt   # Python runtime dependencies
+├── README.md          # User-facing setup and operation guide
+├── AGENTS.md          # Contributor/agent guidelines
+└── .gitignore         # Ignores venvs, pycache, env files, logs, generated outputs
 ```
-transcriber/
-├── main.py          # FastAPI backend + SSE transcription stream
-├── index.html       # Frontend UI (served at /)
-├── requirements.txt
-└── README.md
-```
 
----
+## Operational Notes
 
-## Notes
-
-- No GPU required — runs on CPU with INT8 quantization
-- No FFmpeg install needed — faster-whisper bundles PyAV
-- Files are processed in a temporary directory and deleted immediately after transcription
-- Long files are decoded once, split into overlapping chunks, and streamed chunk-by-chunk
-- The app allows one transcription job at a time so CPU threads do not fight each other
-- The model is loaded once and kept in memory; changing speed presets reloads the matching model automatically
+- No GPU is required, but CPU transcription can still be slow for very long files.
+- The upload is copied to a temp directory and removed after the stream ends or fails.
+- `MAX_UPLOAD_BYTES` controls the upload cap and defaults to 2 GB.
+- Only one transcription runs at a time by design. Extra requests wait and receive a queued status event.
+- Extremely long files are still decoded into memory before chunking. A future improvement would stream/decode directly into disk-backed chunks.
